@@ -119,3 +119,73 @@ def create_exp_dir(path, scripts_to_save=None):
       dst_file = os.path.join(path, 'scripts', os.path.basename(script))
       shutil.copyfile(script, dst_file)
 
+def generate_default_fix_cfg(names, scale=0, bitwidth=8, method=0):
+    return {
+        n: {
+            "method": torch.autograd.Variable(
+                torch.IntTensor(np.array([method])), requires_grad=False
+            ),
+            "scale": torch.autograd.Variable(
+                torch.IntTensor(np.array([scale])), requires_grad=False
+            ),
+            "bitwidth": torch.autograd.Variable(
+                torch.IntTensor(np.array([bitwidth])), requires_grad=False
+            ),
+        }
+        for n in names
+    }
+
+# https://discuss.pytorch.org/t/how-to-override-the-gradients-for-parameters/3417/6
+class Floor(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, x):
+        return x.floor()
+
+    @staticmethod
+    def backward(ctx, g):
+        return g
+
+# https://discuss.pytorch.org/t/how-to-override-the-gradients-for-parameters/3417/6
+class Round(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, x):
+        return x.round()
+
+    @staticmethod
+    def backward(ctx, g):
+        return g
+
+def calc_zero_ratio(weights, scale):
+    step = 2 ** (scale - 8)
+    #x = Round.apply(weights / step) * step
+
+    y = Round.apply(weights.abs() / step).data.cpu().numpy()
+    b1 = np.floor(y/64)
+    b2 = np.floor((y-b1*64)/16)
+    b3 = np.floor((y-b1*64-b2*16)/4)
+    b4 = y-b1*64-b2*16-b3*4
+
+    zero_cnt = np.array([np.count_nonzero(b1==0), np.count_nonzero(b2==0), np.count_nonzero(b3==0), np.count_nonzero(b4==0)])
+    total_param_cnt = np.array([np.size(b1), np.size(b2), np.size(b3), np.size(b4)])
+    return zero_cnt, total_param_cnt
+
+def calc_l1_and_zero_ratio(weights, scale):
+    x = Round.apply(weights.abs() / 2 ** (scale - 8))
+
+    b1 = Floor.apply(x/64)
+    b2 = Floor.apply((x-b1.detach()*64)/16)
+    b3 = Floor.apply((x-b1.detach()*64-b2.detach()*16)/4)
+    b4 = x-b1.detach()*64-b2.detach()*16-b3.detach()*4
+
+    l1_norm = b1.abs().sum() + b2.abs().sum() + b3.abs().sum() + b4.abs().sum()
+
+    b1_ = b1.data.cpu().numpy()
+    b2_ = b2.data.cpu().numpy()
+    b3_ = b3.data.cpu().numpy()
+    b4_ = b4.data.cpu().numpy()
+
+    zero_cnt = np.array([np.count_nonzero(b1_==0), np.count_nonzero(b2_==0), np.count_nonzero(b3_==0), np.count_nonzero(b4_==0)])
+    total_param_cnt = np.array([np.size(b1_), np.size(b2_), np.size(b3_), np.size(b4_)])
+
+    return l1_norm, zero_cnt, total_param_cnt
+

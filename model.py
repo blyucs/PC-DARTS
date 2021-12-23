@@ -2,10 +2,10 @@ import torch
 import torch.nn as nn
 from operations import *
 from torch.autograd import Variable
+import nics_fix_pt.nn_fix as nnf
 from utils import drop_path
 
-
-class Cell(nn.Module):
+class Cell(nnf.FixTopModule):
 
   def __init__(self, genotype, C_prev_prev, C_prev, C, reduction, reduction_prev):
     super(Cell, self).__init__()
@@ -107,20 +107,39 @@ class AuxiliaryHeadImageNet(nn.Module):
     x = self.classifier(x.view(x.size(0),-1))
     return x
 
-
-class NetworkCIFAR(nn.Module):
+class NetworkCIFAR(nnf.FixTopModule):
 
   def __init__(self, C, num_classes, layers, auxiliary, genotype):
     super(NetworkCIFAR, self).__init__()
+
+    self.stem_conv_fix_params = generate_default_fix_cfg(
+    ["weight"], method=1, bitwidth=BITWIDTH)
+
+    self.fc_fix_params = generate_default_fix_cfg(
+        ["weight", "bias"], method=1, bitwidth=BITWIDTH)
+
+    activation_num = 5
+    self.fix_params = [
+        generate_default_fix_cfg(["activation"], method=1, bitwidth=BITWIDTH)
+        for _ in range(activation_num)
+    ]
+
+    # initialize activation fix modules
+    for i in range(len(self.fix_params)):
+        setattr(self, "fix"+str(i), nnf.Activation_fix(nf_fix_params=self.fix_params[i]))
+
     self._layers = layers
     self._auxiliary = auxiliary
 
     stem_multiplier = 3
     C_curr = stem_multiplier*C
-    self.stem = nn.Sequential(
-      nn.Conv2d(3, C_curr, 3, padding=1, bias=False),
-      nn.BatchNorm2d(C_curr)
-    )
+    #self.stem = nn.Sequential(
+    #  nn.Conv2d(3, C_curr, 3, padding=1, bias=False),
+    #  nn.BatchNorm2d(C_curr)
+    #)
+
+    self.stem_conv = nnf.Conv2d_fix(3, C_curr, 3, padding=1, bias=False, nf_fix_params=self.stem_conv_fix_params)
+    self.stem_bn = nn.BatchNorm2d(C_curr)
     
     C_prev_prev, C_prev, C_curr = C_curr, C_curr, C
     self.cells = nn.ModuleList()
@@ -141,18 +160,22 @@ class NetworkCIFAR(nn.Module):
     if auxiliary:
       self.auxiliary_head = AuxiliaryHeadCIFAR(C_to_auxiliary, num_classes)
     self.global_pooling = nn.AdaptiveAvgPool2d(1)
-    self.classifier = nn.Linear(C_prev, num_classes)
+    self.classifier = nnf.Linear_fix(C_prev, num_classes, nf_fix_params=self.fc_fix_params)
 
   def forward(self, input):
     logits_aux = None
-    s0 = s1 = self.stem(input)
+    #s0 = s1 = self.stem(input)
+    input = self.fix0(input)
+    input = self.fix1(self.stem_conv(input))
+    input = self.fix2(self.stem_bn(input))
+    s0 = s1 = input
     for i, cell in enumerate(self.cells):
       s0, s1 = s1, cell(s0, s1, self.drop_path_prob)
       if i == 2*self._layers//3:
         if self._auxiliary and self.training:
           logits_aux = self.auxiliary_head(s1)
-    out = self.global_pooling(s1)
-    logits = self.classifier(out.view(out.size(0),-1))
+    out = self.fix3(self.global_pooling(s1))
+    logits = self.fix4(self.classifier(out.view(out.size(0),-1)))
     return logits, logits_aux
 
 

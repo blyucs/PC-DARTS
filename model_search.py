@@ -5,7 +5,7 @@ from operations import *
 from torch.autograd import Variable
 from genotypes import PRIMITIVES
 from genotypes import Genotype
-
+import numpy as np
 def channel_shuffle(x, groups):
     batchsize, num_channels, height, width = x.data.size()
 
@@ -41,7 +41,7 @@ class MixedOp(nn.Module):
     dim_2 = x.shape[1]
     xtemp = x[ : , :  dim_2//self.k, :, :]
     xtemp2 = x[ : ,  dim_2//self.k:, :, :]
-    temp1 = sum(w * op(xtemp) for w, op in zip(weights, self._ops))
+    temp1 = sum(w.cuda() * op(xtemp).cuda() for w, op in zip(weights, self._ops))
     #reduction cell needs pooling before concat
     if temp1.shape[2] == x.shape[2]:
       ans = torch.cat([temp1,xtemp2],dim=1)
@@ -52,8 +52,23 @@ class MixedOp(nn.Module):
     #except channe shuffle, channel shift also works
     return ans
 
-
-class Cell(nn.Module):
+def generate_default_fix_cfg(names, scale=0, bitwidth=8, method=0):
+    return {
+        n: {
+            "method": torch.autograd.Variable(
+                torch.IntTensor(np.array([method])), requires_grad=False
+            ),
+            "scale": torch.autograd.Variable(
+                torch.IntTensor(np.array([scale])), requires_grad=False
+            ),
+            "bitwidth": torch.autograd.Variable(
+                torch.IntTensor(np.array([bitwidth])), requires_grad=False
+            ),
+        }
+        for n in names
+    }
+	
+class Cell(nnf.FixTopModule):  # must do this?
 
   def __init__(self, steps, multiplier, C_prev_prev, C_prev, C, reduction, reduction_prev):
     super(Cell, self).__init__()
@@ -82,29 +97,47 @@ class Cell(nn.Module):
     states = [s0, s1]
     offset = 0
     for i in range(self._steps):
-      s = sum(weights2[offset+j]*self._ops[offset+j](h, weights[offset+j]) for j, h in enumerate(states))
+      s = sum(weights2[offset+j].cuda() * self._ops[offset+j](h, weights[offset+j]).cuda() for j, h in enumerate(states))
       offset += len(states)
       states.append(s)
 
     return torch.cat(states[-self._multiplier:], dim=1)
 
 
-class Network(nn.Module):
+class Network(nnf.FixTopModule):
 
   def __init__(self, C, num_classes, layers, criterion, steps=4, multiplier=4, stem_multiplier=3):
     super(Network, self).__init__()
+    self.stem_conv_fix_params = generate_default_fix_cfg(
+        ["weight"], method=1, bitwidth=BITWIDTH)
+
+    self.fc_fix_params = generate_default_fix_cfg(
+        ["weight", "bias"], method=1, bitwidth=BITWIDTH)
+
+    activation_num = 5
+    self.fix_params = [
+        generate_default_fix_cfg(["activation"], method=1, bitwidth=BITWIDTH)
+        for _ in range(activation_num)
+    ]
     self._C = C
     self._num_classes = num_classes
+
+    # initialize activation fix modules
+    for i in range(len(self.fix_params)):
+        setattr(self, "fix"+str(i), nnf.Activation_fix(nf_fix_params=self.fix_params[i]))
+
     self._layers = layers
     self._criterion = criterion
     self._steps = steps
     self._multiplier = multiplier
 
     C_curr = stem_multiplier*C
-    self.stem = nn.Sequential(
-      nn.Conv2d(3, C_curr, 3, padding=1, bias=False),
-      nn.BatchNorm2d(C_curr)
-    )
+    #self.stem = nn.Sequential(
+    #  nn.Conv2d(3, C_curr, 3, padding=1, bias=False),
+    #  nn.BatchNorm2d(C_curr)
+    #)
+    self.stem_conv = nnf.Conv2d_fix(3, C_curr, 3, padding=1, bias=False, nf_fix_params=self.stem_conv_fix_params)
+    self.stem_bn = nn.BatchNorm2d(C_curr)
  
     C_prev_prev, C_prev, C_curr = C_curr, C_curr, C
     self.cells = nn.ModuleList()
@@ -121,8 +154,8 @@ class Network(nn.Module):
       C_prev_prev, C_prev = C_prev, multiplier*C_curr
 
     self.global_pooling = nn.AdaptiveAvgPool2d(1)
-    self.classifier = nn.Linear(C_prev, num_classes)
-
+    #self.classifier = nn.Linear(C_prev, num_classes)
+    self.classifier = nnf.Linear_fix(C_prev, num_classes, nf_fix_params=self.fc_fix_params)
     self._initialize_alphas()
 
   def new(self):
@@ -132,7 +165,12 @@ class Network(nn.Module):
     return model_new
 
   def forward(self, input):
-    s0 = s1 = self.stem(input)
+    input = self.fix0(input)
+    input = self.fix1(self.stem_conv(input))
+    input = self.fix2(self.stem_bn(input))
+    s0 = s1 = input
+    #s0 = s1 = self.stem(input)
+
     for i, cell in enumerate(self.cells):
       if cell.reduction:
         weights = F.softmax(self.alphas_reduce, dim=-1)
@@ -157,8 +195,8 @@ class Network(nn.Module):
           n += 1
           weights2 = torch.cat([weights2,tw2],dim=0)
       s0, s1 = s1, cell(s0, s1, weights,weights2)
-    out = self.global_pooling(s1)
-    logits = self.classifier(out.view(out.size(0),-1))
+    out = self.fix3(self.global_pooling(s1))
+    logits = self.fix4(self.classifier(out.view(out.size(0),-1)))
     return logits
 
   def _loss(self, input, target):
