@@ -16,8 +16,9 @@ import nics_fix_pt as nfp
 from torch.autograd import Variable
 from model_search import Network
 from architect import Architect
+from bitslice_sparsity import BitSparsity
 from utils import *
-os.environ["CUDA_VISIBLE_DEVICES"]="0,2,3"   # batchsize
+os.environ["CUDA_VISIBLE_DEVICES"]="0,1,2,3"   # batchsize
 
 parser = argparse.ArgumentParser("cifar")
 parser.add_argument('--data', type=str, default='../data', help='location of the data corpus')
@@ -29,6 +30,7 @@ parser.add_argument('--batch_size', type=int, default=160, help='batch size')
 parser.add_argument('--val_batch_size', type=int, default=64, help='batch size')
 # parser.add_argument('--val_batch_size', type=int, default=128, help='batch size')
 parser.add_argument('--learning_rate', type=float, default=0.1, help='init learning rate')
+parser.add_argument('--bit_learning_rate', type=float, default=0.05, help='init learning rate')
 parser.add_argument('--learning_rate_min', type=float, default=0.001, help='min learning rate')
 parser.add_argument('--momentum', type=float, default=0.9, help='momentum')
 parser.add_argument('--weight_decay', type=float, default=3e-4, help='weight decay')
@@ -36,9 +38,9 @@ parser.add_argument('--weight_decay', type=float, default=3e-4, help='weight dec
 parser.add_argument('--report_freq', type=float, default=40, help='report frequency')
 # parser.add_argument('--gpu', type=int, default=0, help='gpu device id')
 # parser.add_argument('--epochs', type=int, default=50, help='num of training epochs')
-parser.add_argument('--epochs', type=int, default=10, help='num of training epochs')
+parser.add_argument('--epochs', type=int, default=30, help='num of training epochs')
 parser.add_argument('--init_channels', type=int, default=12, help='num of init channels')
-parser.add_argument('--layers', type=int, default=6, help='total number of layers')
+parser.add_argument('--layers', type=int, default=8, help='total number of layers')
 parser.add_argument('--model_path', type=str, default='saved_models', help='path to save the model')
 parser.add_argument('--cutout', action='store_true', default=False, help='use cutout')
 parser.add_argument('--cutout_length', type=int, default=16, help='cutout length')
@@ -101,7 +103,7 @@ def main():
   else:
       train_data = dset.CIFAR10(root=args.data, train=True, download=True, transform=train_transform)
 
-  # num_train = (int)(len(train_data)*0.1)
+  # num_train = (int)(len(train_data)*0.2)
   num_train = len(train_data)
   indices = list(range(num_train))
   split = int(np.floor(args.train_portion * num_train))
@@ -120,6 +122,7 @@ def main():
         optimizer, float(args.epochs), eta_min=args.learning_rate_min)
 
   architect = Architect(model, args)
+  bitsparsity = BitSparsity(model, args)
 
   for epoch in range(args.epochs):
     scheduler.step()
@@ -134,7 +137,7 @@ def main():
     logging.info(F.softmax(model.module.betas_normal[2:5], dim=-1))
     #model.drop_path_prob = args.drop_path_prob * epoch / args.epochs
     # training
-    train_acc, train_obj = train(train_queue, valid_queue, model, architect, criterion, optimizer, lr,epoch)
+    train_acc, train_obj = train(train_queue, valid_queue, model, architect, criterion, optimizer, lr,epoch, bitsparsity)
     logging.info('train_acc %f', train_acc)
 
     # validation
@@ -145,13 +148,18 @@ def main():
     utils.save(model, os.path.join(args.save, 'weights.pt'))
 
 
-def train(train_queue, valid_queue, model, architect, criterion, optimizer, lr,epoch):
+def train(train_queue, valid_queue, model, architect, criterion, optimizer, lr,epoch, bitsparsity):
   objs = utils.AvgrageMeter()
   top1 = utils.AvgrageMeter()
   top5 = utils.AvgrageMeter()
 
+  # objs_bit = utils.AvgrageMeter()
+  # top1_bit = utils.AvgrageMeter()
+  # top5_bit = utils.AvgrageMeter()
+
+  model.module.set_fix_method(nfp.FIX_AUTO)
+
   for step, (input, target) in enumerate(train_queue):
-    model.module.set_fix_method(nfp.FIX_AUTO)
     model.train()
     n = input.size(0)
 
@@ -165,10 +173,11 @@ def train(train_queue, valid_queue, model, architect, criterion, optimizer, lr,e
     input_search = input_search.cuda()
     target_search = target_search.cuda(non_blocking=True)
 
-    # if epoch>=15:
-    if epoch>=5:
+    if epoch>=10:
+    # if epoch>=3:
       architect.step(input, target, input_search, target_search, lr, optimizer, unrolled=args.unrolled)
       # torch.cuda.empty_cache()
+      bitsparsity.step(valid_queue, logging, 1, args.report_freq, step)
 
     input = input.cuda()
     target = target.cuda(non_blocking=True)
@@ -176,39 +185,9 @@ def train(train_queue, valid_queue, model, architect, criterion, optimizer, lr,e
     logits = model(input)
     loss = criterion(logits, target)
 
-    l1_reg = 0
-    zero_cnt = np.zeros((4, ))
-    total_param_cnt = np.zeros((4, ))
-    cur_fix_cfg = model.module.get_fix_configs(data_only=True)
-    for name, param in model.module.named_parameters():
-      # Using quantization module for batch norm will yield weird behavior,
-      # which we suspect originates from the fixed-point training codes
-      # So we don't quantize the bn module
-      if "bn" in name or "downsample.1" in name or "alphas_normal" in name or "alphas_reduce" in name:
-        continue
-
-      length = len(name.split('.'))
-      temp = cur_fix_cfg
-      for j in range(length):
-        temp = temp[name.split('.')[j]]
-      scale = temp['scale']
-
-      l1_reg_, zero_cnt_, total_param_cnt_ = calc_l1_and_zero_ratio(param, scale)
-      l1_reg += l1_reg_
-      zero_cnt += zero_cnt_
-      total_param_cnt += total_param_cnt_
-
-    loss += args.alpha * l1_reg / np.sum(total_param_cnt)
-
     loss.backward()
     nn.utils.clip_grad_norm(model.parameters(), args.grad_clip)
     optimizer.step()
-
-    # torch.cuda.empty_cache()
-    z1 = zero_cnt[0] / total_param_cnt[0] * 100.0
-    z2 = zero_cnt[1] / total_param_cnt[1] * 100.0
-    z3 = zero_cnt[2] / total_param_cnt[2] * 100.0
-    z4 = zero_cnt[3] / total_param_cnt[3] * 100.0
 
     prec1, prec5 = utils.accuracy(logits, target, topk=(1, 5))
     objs.update(loss.data.item(), n)
@@ -216,7 +195,10 @@ def train(train_queue, valid_queue, model, architect, criterion, optimizer, lr,e
     top5.update(prec5.data.item(), n)
 
     if step % args.report_freq == 0:
-      logging.info('train %03d %e %f %f NonZero_ratio: a:%.2f, b:%.2f, c:%.2f, d:%.2f', step, objs.avg, top1.avg, top5.avg, 100-z1, 100-z2, 100-z3, 100-z4)
+      logging.info('Train accuracy %03d %e top1:%f top5:%f', step, objs.avg, top1.avg, top5.avg)
+
+  # if epoch >= 5:
+  #   bitsparsity.step(valid_queue, logging, 10)
 
   return top1.avg, objs.avg
 
@@ -264,7 +246,7 @@ def infer(valid_queue, model, criterion):
     scale = temp['scale']
 
     zero_cnt_, total_param_cnt_ = calc_zero_ratio(param, scale)
-    l1_reg += torch.norm(param, p=1)
+    # l1_reg += torch.norm(param, p=1)
     zero_cnt += zero_cnt_
     total_param_cnt += total_param_cnt_
 
