@@ -143,7 +143,7 @@ def main():
     # validation
     if args.epochs-epoch<=1:
       valid_acc, valid_obj, z1, z2, z3, z4 = infer(valid_queue, model, criterion)
-      logging.info('valid_acc %f NonZero_ratio: a:%.2f, b:%.2f, c:%.2f, d:%.2f', valid_acc, 100-z1, 100-z2, 100-z3, 100-z4)
+      logging.info('valid_acc %f NonZero_ratio: a:%.2f, b:%.2f, c:%.2f, d:%.2f', valid_acc, z1, z2, z3, z4)
 
     utils.save(model, os.path.join(args.save, 'weights.pt'))
 
@@ -250,10 +250,10 @@ def infer(valid_queue, model, criterion):
     zero_cnt += zero_cnt_
     total_param_cnt += total_param_cnt_
 
-  z1 = zero_cnt[0] / total_param_cnt[0] * 100.0
-  z2 = zero_cnt[1] / total_param_cnt[1] * 100.0
-  z3 = zero_cnt[2] / total_param_cnt[2] * 100.0
-  z4 = zero_cnt[3] / total_param_cnt[3] * 100.0
+  z1 = 100-zero_cnt[0] / total_param_cnt[0] * 100.0
+  z2 = 100-zero_cnt[1] / total_param_cnt[1] * 100.0
+  z3 = 100-zero_cnt[2] / total_param_cnt[2] * 100.0
+  z4 = 100-zero_cnt[3] / total_param_cnt[3] * 100.0
 
   return top1.avg, objs.avg, z1, z2, z3, z4
 
