@@ -12,21 +12,25 @@ import genotypes
 import torch.utils
 import torchvision.datasets as dset
 import torch.backends.cudnn as cudnn
-
+import nics_fix_pt as nfp
+import nics_fix_pt.nn_fix as nnf
 from torch.autograd import Variable
 from model import NetworkCIFAR as Network
 
+from tensorboardX import SummaryWriter
+
+os.environ["CUDA_VISIBLE_DEVICES"]="0,1,2,3"   # batchsize
 
 parser = argparse.ArgumentParser("cifar")
 parser.add_argument('--data', type=str, default='../data', help='location of the data corpus')
 parser.add_argument('--set', type=str, default='cifar10', help='location of the data corpus')
-parser.add_argument('--batch_size', type=int, default=96, help='batch size')
+parser.add_argument('--batch_size', type=int, default=500, help='batch size')
 parser.add_argument('--learning_rate', type=float, default=0.025, help='init learning rate')
 parser.add_argument('--momentum', type=float, default=0.9, help='momentum')
 parser.add_argument('--weight_decay', type=float, default=3e-4, help='weight decay')
 parser.add_argument('--report_freq', type=float, default=50, help='report frequency')
 parser.add_argument('--gpu', type=int, default=0, help='gpu device id')
-parser.add_argument('--epochs', type=int, default=600, help='num of training epochs')
+parser.add_argument('--epochs', type=int, default=400, help='num of training epochs')
 parser.add_argument('--init_channels', type=int, default=12, help='num of init channels')
 parser.add_argument('--layers', type=int, default=8, help='total number of layers')
 parser.add_argument('--model_path', type=str, default='saved_models', help='path to save the model')
@@ -35,13 +39,13 @@ parser.add_argument('--auxiliary_weight', type=float, default=0.4, help='weight 
 parser.add_argument('--cutout', action='store_true', default=False, help='use cutout')
 parser.add_argument('--cutout_length', type=int, default=16, help='cutout length')
 parser.add_argument('--drop_path_prob', type=float, default=0.3, help='drop path probability')
-parser.add_argument('--save', type=str, default='EXP', help='experiment name')
+parser.add_argument('--save', type=str, default='EXP/', help='experiment name')
 parser.add_argument('--seed', type=int, default=0, help='random seed')
-parser.add_argument('--arch', type=str, default='DARTS_V1', help='which architecture to use')
+parser.add_argument('--arch', type=str, default='DARTS_V2', help='which architecture to use')
 parser.add_argument('--grad_clip', type=float, default=5, help='gradient clipping')
 args = parser.parse_args()
 
-args.save = 'eval-{}-{}'.format(args.save, time.strftime("%Y%m%d-%H%M%S"))
+args.save = '{}memristor-nas-{}'.format(args.save, time.strftime("%Y%m%d-%H%M%S"))
 utils.create_exp_dir(args.save, scripts_to_save=glob.glob('*.py'))
 
 log_format = '%(asctime)s %(message)s'
@@ -51,26 +55,31 @@ fh = logging.FileHandler(os.path.join(args.save, 'log.txt'))
 fh.setFormatter(logging.Formatter(log_format))
 logging.getLogger().addHandler(fh)
 
-CIFAR_CLASSES = 10
+train_loss_writer = SummaryWriter(logdir='{}/tb/train_loss'.format(args.save))
+train_acc_writer =SummaryWriter(logdir='{}/tb/train_acc'.format(args.save))
+valid_acc_writer =SummaryWriter(logdir='{}/tb/valid_acc'.format(args.save))
 
+CIFAR_CLASSES = 10
+tb_index = 0
 if args.set=='cifar100':
     CIFAR_CLASSES = 100
 def main():
   if not torch.cuda.is_available():
     logging.info('no gpu device available')
     sys.exit(1)
-
+  global tb_index
   np.random.seed(args.seed)
-  torch.cuda.set_device(args.gpu)
+  #torch.cuda.set_device(args.gpu)
   cudnn.benchmark = True
   torch.manual_seed(args.seed)
   cudnn.enabled=True
   torch.cuda.manual_seed(args.seed)
-  logging.info('gpu device = %d' % args.gpu)
+  # logging.info('gpu device = %d' % args.gpu)
   logging.info("args = %s", args)
 
   genotype = eval("genotypes.%s" % args.arch)
   model = Network(args.init_channels, CIFAR_CLASSES, args.layers, args.auxiliary, genotype)
+  model = nn.DataParallel(model)
   model = model.cuda()
 
   logging.info("param size = %fMB", utils.count_parameters_in_MB(model))
@@ -105,7 +114,7 @@ def main():
   for epoch in range(args.epochs):
     scheduler.step()
     logging.info('epoch %d lr %e', epoch, scheduler.get_lr()[0])
-    model.drop_path_prob = args.drop_path_prob * epoch / args.epochs
+    model.module.drop_path_prob = args.drop_path_prob * epoch / args.epochs
 
     train_acc, train_obj = train(train_queue, model, criterion, optimizer)
     logging.info('train_acc %f', train_acc)
@@ -113,6 +122,13 @@ def main():
     valid_acc, valid_obj = infer(valid_queue, model, criterion)
     logging.info('valid_acc %f', valid_acc)
 
+    train_loss_writer.add_scalar('train_loss', train_obj, tb_index)
+    train_acc_writer.add_scalar('acc', train_acc, tb_index)
+    valid_acc_writer.add_scalar('acc', valid_acc, tb_index)
+    train_loss_writer.close()
+    train_acc_writer.close()
+    valid_acc_writer.close()
+    tb_index+=1
     utils.save(model, os.path.join(args.save, 'weights.pt'))
 
 
@@ -120,6 +136,7 @@ def train(train_queue, model, criterion, optimizer):
   objs = utils.AvgrageMeter()
   top1 = utils.AvgrageMeter()
   top5 = utils.AvgrageMeter()
+  model.module.set_fix_method(nfp.FIX_AUTO)
   model.train()
 
   for step, (input, target) in enumerate(train_queue):

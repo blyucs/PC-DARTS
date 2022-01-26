@@ -44,6 +44,7 @@ if __name__ == '__main__':
     sys.exit(1)
 
   genotype_name = sys.argv[1]
+  # genotype_name = 'BS_V1'
   try:
     genotype = eval('genotypes.{}'.format(genotype_name))
   except AttributeError:

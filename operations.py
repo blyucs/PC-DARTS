@@ -20,7 +20,7 @@ OPS = {
     nn.BatchNorm2d(C, affine=affine)
     ),
 }
-BITWIDTH = 8
+BITWIDTH = 16
 class ReLUConvBN(nn.Module):
 
   def __init__(self, C_in, C_out, kernel_size, stride, padding, affine=True):

@@ -66,7 +66,6 @@ fh = logging.FileHandler(os.path.join(args.save, 'log.txt'))
 fh.setFormatter(logging.Formatter(log_format))
 logging.getLogger().addHandler(fh)
 
-
 CIFAR_CLASSES = 10
 if args.set=='cifar100':
     CIFAR_CLASSES = 100
